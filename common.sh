@@ -8,16 +8,12 @@ VHOSTS_CONF_DIR=$DNMP_DIR/website/http.d
 MYSQL_DATA_DIR=$DNMP_DIR/website/data
 # 日志目录
 LOGS_ROOT=$DNMP_DIR/website/logs
-# 站点配置目录
-if [ ! -d "$LOGS_ROOT" ]; then
-    # 初始化目录
-    mkdir -p $BACKUP_STORAGE_DIR 
-    mkdir -p $VHOSTS_ROOT
-    mkdir -p $VHOSTS_CONF_DIR
-    mkdir -p $MYSQL_DATA_DIR
-    # 初始化站点日志目录
-    mkdir -p $LOGS_ROOT/{nginx,php83,certbot}
-fi
+# 初始化运行目录。逐项创建可兼容不完整恢复和首次部署。
+mkdir -p "$BACKUP_STORAGE_DIR"
+mkdir -p "$VHOSTS_ROOT"
+mkdir -p "$VHOSTS_CONF_DIR"
+mkdir -p "$MYSQL_DATA_DIR"
+mkdir -p "$LOGS_ROOT"/{nginx,php83,certbot}
 
 # RC红色错误  GC绿色成功  LG浅绿输出  BC蓝色输入  SB天蓝确认  CC橙色提示  PC粉色强调
 RC="\033[38;5;196m"; RR="\033[31m"; GC="\033[38;5;82m"; LG="\033[38;5;72m"; BC="\033[39;1;34m"; SB="\033[38;5;45m"
@@ -59,4 +55,3 @@ function echoPC {
 function echoYC {
     echo -e "$YC${1}$ED"
 }
-

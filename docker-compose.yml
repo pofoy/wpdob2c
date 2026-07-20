@@ -8,8 +8,11 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8081:8081"
-    restart: always
+      - "127.0.0.1:8081:8081"
+    restart: unless-stopped
+    depends_on:
+      memcached:
+        condition: service_healthy
     volumes:
       - ./website/letsencrypt:/letsencrypt:ro
       # nginx config
@@ -33,12 +36,10 @@ services:
     # build:
     #   context: ./mysql
     container_name: mysql
-    ports:
-      - "3306:3306"
     volumes:
       - ./mysql/my.conf:/etc/my.cnf:ro
       - ./website/data:/var/lib/mysql/:rw
-    restart: always
+    restart: unless-stopped
     networks:
       - default
     environment:
@@ -46,13 +47,18 @@ services:
       MYSQL_ROOT_HOST: "%"
       MYSQL_ROOT_USER: "${MYSQL_ROOT_USER}"
       TZ: "$TZ"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_ROOT_USER} -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   certbot:
-    image: certbot/certbot:latest
+    image: certbot/certbot:v4.2.0
     # build:
     #   context: ./certbot
     container_name: certbot
-    restart: always
+    restart: unless-stopped
     # Nginx 容器之后启动
     depends_on:
       - nginx
@@ -68,21 +74,21 @@ services:
     networks:
         - default
 
-  # memcached
-#  memcached:
-#    image: memcached:alpine
-#    container_name: memcached
-#    ports:
-#      - "11211:11211"
-#    environment:
-#       MEMCACHED_CACHE_SIZE: "128"
-#    networks:
-#      - default
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: memcached
+    command: ["memcached", "-m", "${MEMCACHED_MEMORY_MB:-256}", "-I", "2m", "-c", "1024"]
+    restart: unless-stopped
+    expose:
+      - "11211"
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'version\r\n' | nc 127.0.0.1 11211 | grep -q VERSION"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - default
 
 networks:
   default:
     driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 18.0.0.0/24

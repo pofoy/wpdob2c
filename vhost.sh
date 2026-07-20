@@ -10,9 +10,11 @@ DNMP_DIR=$(dirname "$SYMLINK_PATH")
 # 路径转换
 DNMP_DIR=$(realpath "$DNMP_DIR")
 # 加载公共变量
-source $DNMP_DIR/common.sh
+source "$DNMP_DIR/common.sh"
 # 加载.env
-source $DNMP_DIR/.env
+source "$DNMP_DIR/.env"
+WOOCOMMERCE_VERSION=${WOOCOMMERCE_VERSION:-10.9.4}
+OBJECT_CACHE_PLUGIN_VERSION=${OBJECT_CACHE_PLUGIN_VERSION:-2.3.3}
 # SSL目录
 SSL_DIR=$DNMP_DIR/website/letsencrypt/live
 # 虚拟主机配置文件
@@ -69,42 +71,189 @@ function random_str {
     if [ -n "$1" ]; then
         length=$1
     fi
-    # 生成随机字符串 数字 字母 大小写
-   echo $(head -c $length /dev/urandom | base64 | tr -d '/' | tr -d '=' | tr -d '+')
+    openssl rand -hex "$(((length + 1) / 2))" | cut -c "1-$length"
 }
+
+function wp_for_site {
+    local domain="$1"
+    shift
+    docker exec nginx wp "$@" --path="/wwwroot/$domain" --allow-root
+}
+
+function wait_for_memcached {
+    local attempt
+    for attempt in $(seq 1 30); do
+        if [ "$(docker inspect -f '{{.State.Health.Status}}' memcached 2>/dev/null)" = "healthy" ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echoRC "Memcached 未通过健康检查."
+    return 1
+}
+
+function configure_production_defaults {
+    local domain="$1"
+    wp_for_site "$domain" config set WP_DEBUG false --raw --type=constant
+    wp_for_site "$domain" config set WP_DEBUG_DISPLAY false --raw --type=constant
+    wp_for_site "$domain" config set SCRIPT_DEBUG false --raw --type=constant
+    wp_for_site "$domain" config set DISALLOW_FILE_EDIT true --raw --type=constant
+    wp_for_site "$domain" config set WP_ENVIRONMENT_TYPE production --type=constant
+    wp_for_site "$domain" config set WP_POST_REVISIONS 10 --raw --type=constant
+    wp_for_site "$domain" rewrite structure '/%postname%/'
+    wp_for_site "$domain" rewrite flush
+}
+
+function install_woocommerce {
+    local domain="$1"
+    if ! wp_for_site "$domain" plugin is-installed woocommerce >/dev/null 2>&1; then
+        wp_for_site "$domain" plugin install woocommerce --version="$WOOCOMMERCE_VERSION"
+    fi
+    wp_for_site "$domain" plugin activate woocommerce
+}
+
+function configure_memcached_object_cache {
+    local domain="$1"
+    local object_cache_backup
+    local object_cache_source="/wwwroot/$domain/wp-content/plugins/object-cache-4-everyone/object-cache-memcached-template.php"
+    local object_cache_target="/wwwroot/$domain/wp-content/object-cache.php"
+
+    wait_for_memcached || return 1
+    wp_for_site "$domain" plugin install object-cache-4-everyone \
+        --version="$OBJECT_CACHE_PLUGIN_VERSION" --force
+    wp_for_site "$domain" config set WP_CACHE true --raw --type=constant
+    wp_for_site "$domain" config set WP_CACHE_KEY_SALT "${domain}:" --type=constant
+    wp_for_site "$domain" config set OC4EVERYONE_MEMCACHED_SERVER \
+        "memcached:11211" --type=constant
+    wp_for_site "$domain" config set OC4EVERYONE_DISABLE_DISK_CACHE \
+        true --raw --type=constant
+
+    if docker exec nginx test -f "$object_cache_target" && \
+        ! docker exec nginx grep -q "Object Cache 4 everyone" "$object_cache_target"; then
+        object_cache_backup="${object_cache_target}.pre-wpdob2c-$(date -u +%Y%m%d%H%M%S)"
+        docker exec nginx cp "$object_cache_target" "$object_cache_backup"
+        echoYC "已备份原对象缓存 drop-in: $object_cache_backup"
+    fi
+
+    docker exec \
+        -e OBJECT_CACHE_SOURCE="$object_cache_source" \
+        -e OBJECT_CACHE_TARGET="$object_cache_target" \
+        nginx php -r '
+        $source = getenv("OBJECT_CACHE_SOURCE");
+        $target = getenv("OBJECT_CACHE_TARGET");
+        $template = file_get_contents($source);
+        if ($template === false) {
+            fwrite(STDERR, "Unable to read object-cache template.\n");
+            exit(1);
+        }
+        $header = "<?php\n/**\n * Plugin Name: Object Cache 4 everyone - Memcached\n */\n?>";
+        $template = $header . $template;
+        $template .= "\ndefine(\"OC4EVERYONE_PREDEFINED_SERVER\", \"memcached:11211\");\n";
+        if (file_put_contents($target, $template) === false) {
+            fwrite(STDERR, "Unable to write object-cache drop-in.\n");
+            exit(1);
+        }
+    ' || return 1
+
+    wp_for_site "$domain" plugin activate object-cache-4-everyone
+
+    docker exec nginx php -r '
+        $cache = new Memcached();
+        $cache->setOption(Memcached::OPT_CONNECT_TIMEOUT, 1000);
+        $cache->addServer("memcached", 11211);
+        $key = "wpdob2c-health-" . bin2hex(random_bytes(6));
+        if (!$cache->set($key, "ok", 30) || $cache->get($key) !== "ok") {
+            fwrite(STDERR, "Memcached set/get failed\n");
+            exit(1);
+        }
+        $cache->delete($key);
+    ' || return 1
+
+    wp_for_site "$domain" eval '
+        if (!wp_using_ext_object_cache()) {
+            fwrite(STDERR, "WordPress object-cache drop-in is not active.\n");
+            exit(1);
+        }
+    ' || return 1
+
+    wp_for_site "$domain" eval '
+        if (!wp_cache_set("wpdob2c-health", "ok", "wpdob2c", 30)) {
+            fwrite(STDERR, "WordPress object-cache write failed.\n");
+            exit(1);
+        }
+    ' || return 1
+    wp_for_site "$domain" eval '
+        $found = false;
+        $value = wp_cache_get("wpdob2c-health", "wpdob2c", false, $found);
+        if (!$found || $value !== "ok") {
+            fwrite(STDERR, "WordPress object-cache persistence check failed.\n");
+            exit(1);
+        }
+        wp_cache_delete("wpdob2c-health", "wpdob2c");
+    ' || return 1
+
+    echoGC "Memcached 对象缓存已启用: $domain"
+}
+
+function configure_b2c_wordpress {
+    local domain="$1"
+    echoSB "配置 B2C WordPress: $domain"
+    configure_production_defaults "$domain" || return 1
+    install_woocommerce "$domain" || return 1
+    configure_memcached_object_cache "$domain" || return 1
+    docker exec nginx chown -R "$NGINX_USER:$NGINX_GROUP" "/wwwroot/$domain"
+    echoGC "WooCommerce 与持久对象缓存配置完成."
+}
+
 # Install WordPress
 function install_wp {
-    # 接收用户输入
-    echo -ne "$BC请输入站点管理员账号(默认:admin):$ED "
-    read -a wp_user; [ -z "$wp_user" ] && wp_user=admin 
-    echo -ne "$BC请输入站点管理员密码(默认:admin):$ED "
-    read -a wp_pass; [ -z "$wp_pass" ] && wp_pass=admin
+    local wp_user wp_pass wp_mail db_prefix database_password site_doc_root generated_password
+    echo -ne "$BC请输入站点管理员账号(默认:storeadmin):$ED "
+    read -r wp_user; [ -z "$wp_user" ] && wp_user=storeadmin
+    echo -ne "$BC请输入站点管理员密码(留空自动生成):$ED "
+    read -rs wp_pass
+    echo
+    if [ -z "$wp_pass" ]; then
+        wp_pass=$(random_str 24)
+        generated_password=1
+    fi
     echo -ne "$BC请输入站点管理员邮箱(默认:admin@$INPUT_DOMAIN_NAME):$ED "
-    read -a wp_mail; [ -z "$wp_mail" ] && wp_mail="admin@$INPUT_DOMAIN_NAME"
+    read -r wp_mail; [ -z "$wp_mail" ] && wp_mail="admin@$INPUT_DOMAIN_NAME"
     # 数据库前缀
-    local db_prefix=$(random_str 3)_
+    db_prefix=$(random_str 3)_
     # 转小写
-    db_prefix=$(echo $db_prefix | tr 'A-Z' 'a-z')
+    db_prefix=$(echo "$db_prefix" | tr 'A-Z' 'a-z')
     # 生成数据库密码
-    local database_password=$(random_str 12)
+    database_password=$(random_str 24)
     # Docker 容器内部 站点文档根目录
-    local site_doc_root=/wwwroot/$INPUT_DOMAIN_NAME
+    site_doc_root="/wwwroot/$INPUT_DOMAIN_NAME"
     # 创建数据库
-    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e "CREATE DATABASE \`$DATABASE_NAME\`;"
+    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e \
+        "CREATE DATABASE \`$DATABASE_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     # 创建数据库用户
-    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e "CREATE USER \`$DATABASE_NAME\`@'%' IDENTIFIED BY '$database_password';"
+    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e \
+        "CREATE USER '$DATABASE_NAME'@'%' IDENTIFIED BY '$database_password';"
     # 授权数据库
-    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e "GRANT ALL PRIVILEGES ON \`$DATABASE_NAME\`.* TO \`$DATABASE_NAME\`@'%';"
-    # 下载WP程序 wp core download --locale=zh_CN --allow-root
-    docker exec nginx wp core download --path=$site_doc_root --allow-root
+    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql mysql -uroot -e \
+        "GRANT ALL PRIVILEGES ON \`$DATABASE_NAME\`.* TO '$DATABASE_NAME'@'%';"
+    # 下载英文 WordPress，便于跨境 B2C 项目直接使用。
+    docker exec nginx wp core download --locale=en_US --path="$site_doc_root" --allow-root
     # 创建数据库配置文件
-    docker exec nginx wp config create --dbname=$DATABASE_NAME --dbuser=$DATABASE_NAME --dbpass=$database_password --dbprefix=$db_prefix --dbhost=mysql:3306 --path=$site_doc_root --allow-root --quiet
+    docker exec nginx wp config create --dbname="$DATABASE_NAME" --dbuser="$DATABASE_NAME" \
+        --dbpass="$database_password" --dbprefix="$db_prefix" --dbhost=mysql:3306 \
+        --dbcharset=utf8mb4 --path="$site_doc_root" --allow-root --quiet
     # 安装WordPress程序
-    docker exec nginx wp core install --url="https://$INPUT_DOMAIN_NAME" --title="My Blog" --admin_user=$wp_user --admin_password=$wp_pass --admin_email=$wp_mail --skip-email --path=$site_doc_root --allow-root
-    # WP配置文件中添加新常量
-    local wp_const="\ndefine('WP_POST_REVISIONS', false);"
-    # 插入到文件
-    sed -i "/\$table_prefix/a\\$wp_const" $SITE_DOC_ROOT/wp-config.php
+    docker exec nginx wp core install --url="https://$INPUT_DOMAIN_NAME" --title="$INPUT_DOMAIN_NAME" \
+        --admin_user="$wp_user" --admin_password="$wp_pass" --admin_email="$wp_mail" \
+        --skip-email --path="$site_doc_root" --allow-root
+
+    configure_b2c_wordpress "$INPUT_DOMAIN_NAME" || return 1
+
+    echoGC "管理员账号: $wp_user"
+    if [ -n "$generated_password" ]; then
+        echoGC "自动生成的管理员密码: $wp_pass"
+        echoYC "请立即将该密码保存到密码管理器."
+    fi
 }
 # 创建站点
 function create_site {
@@ -131,25 +280,28 @@ function create_site {
     # 自动创建站点目录
     mkdir -p "$SITE_DOC_ROOT"
     # 自动创建站点配置文件
-    cp -rf $VHOST_CONF_FILE $VHOSTS_CONF_DIR/$INPUT_DOMAIN_NAME.conf
+    cp -f "$VHOST_CONF_FILE" "$VHOSTS_CONF_DIR/$INPUT_DOMAIN_NAME.conf"
     # 替换域名
-    sed -i "s/default_replace_8888/$INPUT_DOMAIN_NAME/" $VHOSTS_CONF_DIR/$INPUT_DOMAIN_NAME.conf
+    sed -i "s/default_replace_8888/$INPUT_DOMAIN_NAME/g" "$VHOSTS_CONF_DIR/$INPUT_DOMAIN_NAME.conf"
     # 安装WordPress
-    echo -ne "$BC是否安装WordPrss(y/N):$ED "
-    read -a iswp
+    echo -ne "$BC是否安装 B2C WordPress(y/N):$ED "
+    read -r iswp
     # 如果输入为空,则默认不安装
     if [ -z "$iswp" ]; then
         iswp=n
     fi
     # 如果输入为y或Y,则安装WordPress
-    if [ "$iswp" = "y" -o "$iswp" = "Y" ]; then
-        install_wp
+    if [ "$iswp" = "y" ] || [ "$iswp" = "Y" ]; then
+        if ! install_wp; then
+            echoRC "B2C WordPress 安装失败，请检查上方错误后重试."
+            return 1
+        fi
     else
-        echo 'This a Temp Site.' > $SITE_DOC_ROOT/index.php
+        printf '%s\n' 'This is a temporary site.' > "$SITE_DOC_ROOT/index.php"
     fi
     iswp=$(echo $iswp | tr 'a-z' 'A-Z')
     # 修改文件权限 - 使用容器内的路径
-    docker exec nginx chown -R $NGINX_USER:$NGINX_GROUP /wwwroot/$INPUT_DOMAIN_NAME
+    docker exec nginx chown -R "$NGINX_USER:$NGINX_GROUP" "/wwwroot/$INPUT_DOMAIN_NAME"
     # 重新加载nginx配置
     docker exec nginx nginx -s reload
     # 输出成功
@@ -165,17 +317,12 @@ function site_hostname_get {
     local -a sites
     # 声明局部变量
     local site_name
-    # 使用通配符直接读取到数组
-    sites=("$VHOSTS_CONF_DIR"/*)
+    mapfile -t sites < <(find "$VHOSTS_CONF_DIR" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' | sort)
     # 如果目录为空，则退出
     if [ ${#sites[@]} -eq 0 ]; then
         echoCC "没有找到任何站点"
         return 1
     fi
-    # 去除路径前缀，只保留站点名
-    for i in "${!sites[@]}"; do
-        sites[$i]=$(basename "${sites[$i]}")
-    done
     # 显示站点列表
     local i=1
     for site in "${sites[@]}"; do
@@ -494,6 +641,19 @@ function fix_site_file_permissions {
     # 重新加载nginx配置
     docker exec nginx nginx -s reload
 }
+
+function configure_existing_b2c_site {
+    if ! site_exists; then
+        return 1
+    fi
+    site_hostname_get || return 1
+    if ! docker exec nginx test -f "/wwwroot/$SITE_HOSTNAME/wp-config.php"; then
+        echoRC "未找到 WordPress 配置: /wwwroot/$SITE_HOSTNAME/wp-config.php"
+        return 1
+    fi
+    configure_b2c_wordpress "$SITE_HOSTNAME"
+}
+
 # 安装phpMyAdmin
 function install_phpmyadmin {
     # 判断phpMyAdmin是否已安装
@@ -577,8 +737,9 @@ function site_cmd {
         echo -e "${SB}5${ED}.${LG}备份站点${ED}"
         echo -e "${SB}6${ED}.${LG}恢复站点${ED}"
         echo -e "${SB}7${ED}.${LG}修复站点文件权限${ED}"
-        echo -e "${SB}8${ED}.${LG}安装phpMyAdmin${ED}"
-        echo -e "${SB}9${ED}.${LG}SSL证书续签管理${ED}"
+        echo -e "${SB}8${ED}.${LG}配置/检查 B2C 站点${ED}"
+        echo -e "${SB}9${ED}.${LG}安装phpMyAdmin${ED}"
+        echo -e "${SB}10${ED}.${LG}SSL证书续签管理${ED}"
         echo -e "${SB}e${ED}.${LG}退出${ED}"
         echo -ne "${BC}请选择: ${ED}"
         read -a num2
@@ -590,8 +751,9 @@ function site_cmd {
             5) site_backup ;;
             6) site_restore ;;
             7) fix_site_file_permissions ;;
-            8) install_phpmyadmin ;;
-            9) certbot_renew_ssl ;;
+            8) configure_existing_b2c_site ;;
+            9) install_phpmyadmin ;;
+            10) certbot_renew_ssl ;;
             e) break ;;
             *) echoCC '输入有误.'
         esac
