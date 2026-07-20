@@ -6,13 +6,14 @@ Memcached network with per-site persistent object-cache configuration.
 
 ## Install
 
-Use a root login so `~` consistently resolves to `/root`:
+Run these commands from the directory where the `wpdob2c/` folder should be
+created:
 
 ```bash
 sudo -i
 apt update && apt install git -y
-git clone --depth 1 https://github.com/pofoy/wpdob2c.git ~/wpdob2c
-bash ~/wpdob2c/install.sh
+git clone --depth 1 https://github.com/pofoy/wpdob2c.git wpdob2c
+bash wpdob2c/install.sh
 ```
 
 The installer preserves an existing `.env` and MySQL password when rerun.
