@@ -44,6 +44,23 @@ that set cookies or prohibit caching are not stored.
 MySQL and Memcached are not published to the host network. phpMyAdmin is bound
 to `127.0.0.1:8081`; access it remotely through an SSH tunnel.
 
+## Sync Cart
+
+Requests containing the Sync Cart `sign_key` query parameter always bypass the
+FastCGI cache and reach WordPress. The general query-string bypass currently
+provides the same protection; the explicit rule preserves this contract if the
+general policy changes later.
+
+Sites hosted by the same wpdob2c stack can use `memcached` as the Sync Cart host
+and `11211` as the port. They already share the stack's private Memcached
+service. The hostname is `memcached`, not `mencached`.
+
+Sites on different servers need a Memcached endpoint reachable by both sites,
+preferably over a private VPN, an SSH tunnel, or a managed Memcached service.
+Never publish port `11211` directly to the Internet. A managed Redis service is
+not a drop-in replacement unless the Sync Cart plugin explicitly supports the
+Redis protocol. Both sites must use the same Sync Cart cache endpoint.
+
 ## Validate Changes
 
 ```bash

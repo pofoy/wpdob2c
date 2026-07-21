@@ -18,6 +18,7 @@ if grep -q 'fastcgi_ignore_headers' nginx/nginx.conf; then
 fi
 
 grep -q 'wp_woocommerce_session_' nginx/vhost.conf
+grep -q 'if (\$arg_sign_key != "")' nginx/vhost.conf
 grep -q 'fastcgi_no_cache \$skip_cache \$upstream_http_set_cookie' nginx/vhost.conf
 grep -q 'WP_CACHE_KEY_SALT' vhost.sh
 grep -q 'object-cache-4-everyone' vhost.sh
