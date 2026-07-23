@@ -1,0 +1,7 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl gzip tzdata
+COPY update-dbip.sh /usr/local/bin/update-dbip
+RUN chmod 0755 /usr/local/bin/update-dbip
+
+ENTRYPOINT ["/usr/local/bin/update-dbip"]

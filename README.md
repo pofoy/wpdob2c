@@ -61,6 +61,14 @@ Never publish port `11211` directly to the Internet. A managed Redis service is
 not a drop-in replacement unless the Sync Cart plugin explicitly supports the
 Redis protocol. Both sites must use the same Sync Cart cache endpoint.
 
+## Shared GeoIP
+
+The optional `geoip` Docker Compose profile provides `jcm-geoip`, a signed,
+local-MMDB service intended for B2C analytics and checkout routing. It is not a
+browser-facing public IP lookup API. See [geoip/README.md](geoip/README.md) for
+DB-IP Lite updates, HMAC request signing, the `ip.dnooo.com` vhost template, and
+startup commands.
+
 ## Validate Changes
 
 ```bash

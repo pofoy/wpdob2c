@@ -6,6 +6,9 @@ cd "$ROOT_DIR"
 
 bash -n install.sh common.sh vhost.sh
 docker compose --env-file env.sample config --quiet
+JCM_GEOIP_HMAC_SECRET=validation-only \
+JCM_GEOIP_ALLOWED_PROJECTS=validation \
+    docker compose --env-file env.sample --profile geoip config --quiet
 
 if grep -Eq '(3306:3306|11211:11211)' docker-compose.yml; then
     echo "Database or Memcached port must not be published." >&2

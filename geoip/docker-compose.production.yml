@@ -1,0 +1,42 @@
+services:
+  jcm-geoip:
+    build:
+      context: .
+    image: jcm-geoip:local
+    container_name: jcm-geoip
+    restart: unless-stopped
+    environment:
+      JCM_GEOIP_LISTEN: ":8080"
+      JCM_GEOIP_CITY_DB: /var/lib/jcm-geoip/GeoLite2-City.mmdb
+      JCM_GEOIP_ASN_DB: /var/lib/jcm-geoip/GeoLite2-ASN.mmdb
+      JCM_GEOIP_HMAC_SECRET: "${JCM_GEOIP_HMAC_SECRET:?set JCM_GEOIP_HMAC_SECRET in .env}"
+      JCM_GEOIP_ALLOWED_PROJECTS: "${JCM_GEOIP_ALLOWED_PROJECTS:?set at least one stable project id in .env}"
+      JCM_GEOIP_MAX_BATCH: "${JCM_GEOIP_MAX_BATCH:-100}"
+      JCM_GEOIP_MAX_REQUESTS_PER_MINUTE: "${JCM_GEOIP_MAX_REQUESTS_PER_MINUTE:-600}"
+      JCM_GEOIP_CACHE_TTL_HOURS: "${JCM_GEOIP_CACHE_TTL_HOURS:-168}"
+      JCM_GEOIP_CACHE_SIZE: "${JCM_GEOIP_CACHE_SIZE:-20000}"
+    volumes:
+      - ./data:/var/lib/jcm-geoip:ro
+    expose:
+      - "8080"
+    networks:
+      commerce:
+
+  dbip-update:
+    build:
+      context: .
+      dockerfile: Dockerfile.updater
+    image: jcm-dbip-updater:local
+    container_name: jcm-dbip-update
+    restart: unless-stopped
+    environment:
+      DBIP_UPDATE_INTERVAL_HOURS: "${DBIP_UPDATE_INTERVAL_HOURS:-720}"
+    volumes:
+      - ./data:/usr/share/GeoIP:rw
+    networks:
+      commerce:
+
+networks:
+  commerce:
+    external: true
+    name: "${JCM_GEOIP_DOCKER_NETWORK:-wpdo5_default}"
